@@ -1,6 +1,7 @@
 services:
   - type: web
     name: northern-gym-linnworks-api
+    rootDir: northern-gym-linnworks-api
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
