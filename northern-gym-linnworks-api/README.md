@@ -1,11 +1,12 @@
+[README.md](https://github.com/user-attachments/files/35411258/README.md)
 # Northern Gym — Linnworks lookup API for Zendesk
 
-**Purpose:** Zendesk AI agents / actions call one endpoint using a channel reference and requester email. The API obtains Linnworks session credentials, searches open and processed orders, fetches order details, confirms exact channel reference and matching email, and returns a compact JSON payload. **AfterShip is not required or integrated in v1.** No customer OTP step.
+**Purpose:** Zendesk AI agents / actions call one endpoint using either a channel reference or a Linnworks order ID. The customer does **not** have to supply an email address or complete an OTP check. Reference-only lookups return limited dispatch status; tracking details require a matching email supplied by trusted Zendesk context. **AfterShip is optional and is not integrated in this version.**
 
 ## Deploy on GitHub + Render
 
-1. Upload **all files** (including `render.yaml`) to the **root** of a GitHub repo, maintaining the `tests/` folder. Do not upload `.env` or secrets.
-2. In Render, choose **New > Blueprint**, connect this GitHub repo, and apply the `render.yaml` configuration. If you already have a Render web service, you can instead point it at the repo and use the same build/start commands defined in `render.yaml`.
+1. For the existing Northern Gym repository, replace `northern-gym-linnworks-api/main.py` and optionally `README.md` and `tests/test_lookup.py` within that same folder. Do not upload `.env` or secrets.
+2. Your existing Render Blueprint already points to `northern-gym-linnworks-api/render.yaml`, which sets `rootDir: northern-gym-linnworks-api`. No new Render service or environment variable is required. Deploy the updated GitHub commit.
 3. Set environment variables in the Render dashboard (or at Blueprint creation):
    - `LINNWORKS_APP_ID` — Linnworks developer app ID.
    - `LINNWORKS_APP_SECRET` — Linnworks developer app secret.
@@ -13,18 +14,41 @@
    - `API_BEARER_TOKEN` — a strong random shared secret known to Zendesk (not a Linnworks token).
 4. Verify `GET https://YOUR-RENDER-URL/health` returns `{"status":"ok"...}`.
 5. Configure a Zendesk HTTP action/connection to send `POST https://YOUR-RENDER-URL/v1/orders/lookup`, with headers `Authorization: Bearer YOUR_API_BEARER_TOKEN` and `Content-Type: application/json`.
-6. Test with a real order whose channel reference and requester email are known. Do not treat the health endpoint as proof that Linnworks authorization works.
+6. Test with a real channel reference **without an email**, then with a real Linnworks order number using `order_id`. Confirm that only a limited status is returned. Do not treat the health endpoint as proof that every Linnworks search type works.
 
 For a Linnworks system integration app: obtain installation token through the developer portal's installation URL, then the API uses `Auth/AuthorizeByApplication` to generate temporary session tokens. See [Linnworks documentation](https://apidocs.linnworks.net/docs/system-integration-setup).
 
 ## Zendesk action JSON
 
-Request:
+Reference-only request (no email prompt):
+```json
+{"channel_reference":"NG-12345"}
+```
+
+Alternatively, if the customer knows the Linnworks order ID or order number:
+```json
+{"order_id":"12345"}
+```
+
+For trusted Zendesk tickets where Zendesk already knows and can supply the requester email:
 ```json
 {"channel_reference":"NG-12345","requester_email":"customer@example.com"}
 ```
 
-Response on a confirmed dispatched order with tracking:
+Reference-only response for a dispatched order (no tracking or personal details):
+```json
+{
+  "found": true,
+  "action": "answer_customer",
+  "reason": "reference_only_status",
+  "channel_reference": "NG-12345",
+  "order": {"status": "dispatched"},
+  "customer_message": "The order linked to that reference is marked as dispatched. Please check the dispatch email for your parcel tracking details."
+}
+```
+
+
+Response on a dispatched order where Zendesk also supplied a matching trusted requester email:
 ```json
 {
   "found": true,
@@ -50,14 +74,17 @@ Response on a confirmed dispatched order with tracking:
 }
 ```
 
-**Zendesk branching:** If `action = answer_customer`, use `customer_message`; otherwise, escalate to an agent. The response can be mapped to existing Zendesk ticket fields for channel reference, Linnworks order number, carrier, tracking number, and dispatch status. Actual ticket-field updates require Zendesk configuration; this API does **not** write directly to Zendesk. The action must not expose raw JSON or order fields without account verification.
+**Zendesk branching:** If `action = answer_customer`, use `customer_message`; otherwise escalate to an agent. For reference-only calls, only `order.status` is returned. Detailed fields like courier, tracking, items and Linnworks order ID are returned only for verified email matches. Ticket-field updates still require separate Zendesk configuration; this API does **not** write directly to Zendesk.
 
 ## Behaviour and limits
 
 - Searches both open and processed orders with `OpenOrders/SearchOrders` (`IncludeProcessed=true`), then loads details using `Orders/GetOrdersById`.
-- Returns order details **only** when exactly one order matches reference and the requester email matches the Linnworks address. No OTP. If email is not supplied or cannot match, it escalates without returning private order details. Matching a reference and email is a minimal check, **not strong identity verification**; configure the Zendesk action for authenticated conversations or trusted requester contexts rather than anonymous public requests.
-- Does not invent tracking links; Linnworks' tracking number is exposed while `tracking_url` remains `null` until a reliable URL source is configured.
-- Can respond automatically only to a matched dispatched order with a tracking number, otherwise escalates. If an order is on hold or cancelled, it escalates.
+- Accepts either `channel_reference` or `order_id`. Confirms exact matches against channel reference fields, Linnworks `OrderId`, and `NumOrderId` in returned search results. Live Linnworks search coverage for each identifier must be tested.
+- With no email, returns only a limited status. A matched dispatched order with tracking can receive a generic automatic response, but **no tracking number, courier, order contents, or personally identifying information is returned**. Other statuses escalate.
+- When Zendesk supplies an email, matching is still required before detailed tracking is returned. A mismatched email escalates; it does not fall back to disclosing detailed fields. No customer OTP step is required.
+- **Security:** Knowing an order ID is not proof of identity. A status-only response still discloses that an order reference exists; add Zendesk rate limits / abuse controls and prevent anonymous bulk enquiries. Do not expose this API bearer token to browsers or customers. For complete tracking details, use trusted Zendesk customer context. Matching a reference and email is a minimal check, not strong identity verification.
+- Does not invent tracking links. For reference-only lookups, no tracking number or URL is exposed. Verified lookups may return the Linnworks tracking number; `tracking_url` remains `null` until a reliable source is configured.
+- Can respond automatically only to a matched dispatched order with a tracking number, but reference-only replies are status-only. Orders on hold, cancelled, or without confirmed tracking escalate.
 - Missing orders, multiple matches, unexpected Linnworks responses and Linnworks outages become an `escalate_to_agent` result. Search responses capped at 40 candidate IDs. API failures are handled conservatively rather than misrepresented as 'not found'.
 - `GET /health` is unauthenticated so Render can check availability. The lookup endpoint requires a server-to-server bearer token. Never commit this token or Linnworks secrets to GitHub.
 - The code is stateless, with in-memory token refresh. No database, scheduled sync, Zendesk data enrichment, AfterShip tracking or account provisioning in v1.
@@ -76,9 +103,9 @@ uvicorn main:app --reload
 curl -X POST 'http://127.0.0.1:8000/v1/orders/lookup' \
  -H 'Authorization: Bearer YOUR_API_BEARER_TOKEN' \
  -H 'Content-Type: application/json' \
- -d '{"channel_reference":"REAL-REFERENCE","requester_email":"real.customer@example.com"}'
+ -d '{"channel_reference":"REAL-REFERENCE"}'
 ```
 
 ## Verify before production
 
-Review actual Linnworks responses against the account's data, especially search coverage for processed orders and emails on imported marketplace orders. Test real dispatched, open, no-match, duplicate-reference, email-mismatch and expired-session cases. Automated tests cover local mapping logic only; **live Linnworks and Zendesk connectivity has not been tested**.
+Review actual Linnworks responses, especially search coverage for both reference and Linnworks order-number searches, and processed orders. Test real dispatched, open, no-match, duplicate-reference, wrong-email, and expired-session cases. **Nine local tests passed. The updated API has not yet been deployed or live-tested against Linnworks / Zendesk.**
