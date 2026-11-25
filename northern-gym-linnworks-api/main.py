@@ -17,7 +17,10 @@ app = FastAPI(title='Northern Gym Linnworks Lookup', version='1.0.0', docs_url=N
 
 
 class LookupRequest(BaseModel):
-    channel_reference: str = Field(min_length=1, max_length=120)
+    # Customers can supply either a sales-channel reference or a Linnworks order ID.
+    # Email is optional: Zendesk can supply it silently when a trusted email exists.
+    channel_reference: str | None = Field(default=None, min_length=1, max_length=120)
+    order_id: str | None = Field(default=None, min_length=1, max_length=120)
     requester_email: str | None = Field(default=None, max_length=320)
 
 
@@ -152,10 +155,18 @@ def extract_email(order: dict) -> str | None:
 
 
 def reference_matches(order: dict, target: str) -> bool:
+    # SearchOrders may return partial matches. Confirm an exact identifier match.
+    if not target:
+        return False
     general = order.get('GeneralInfo') or {}
-    return any(normalize(general.get(k)) == target for k in (
-        'ReferenceNum', 'SecondaryReference', 'ExternalReferenceNum'
-    ))
+    identifiers = [
+        general.get('ReferenceNum'),
+        general.get('SecondaryReference'),
+        general.get('ExternalReferenceNum'),
+        order.get('NumOrderId'),
+        order.get('OrderId'),
+    ]
+    return any(normalize(value) == target for value in identifiers)
 
 
 def escalate(reason: str, reference: str) -> dict:
@@ -202,13 +213,57 @@ def format_order(order: dict, reference: str) -> dict:
     }
 
 
+def format_reference_only(order: dict, reference: str) -> dict:
+    """Respond to an unverified reference without releasing tracking or personal data.
+
+    A customer knowing an order number is not proof they own the order. In
+    particular, some couriers' tracking pages can expose delivery details.
+    """
+    general = order.get('GeneralInfo') or {}
+    shipping = order.get('ShippingInfo') or {}
+    held = bool(general.get('HoldOrCancel'))
+    dispatched_with_tracking = bool(order.get('Processed') and shipping.get('TrackingNumber'))
+
+    if held:
+        status = 'requires_agent'
+        action = 'escalate_to_agent'
+        reason = 'manual_review_required'
+        message = 'Our team will review the order enquiry and provide an update.'
+    elif dispatched_with_tracking:
+        status = 'dispatched'
+        action = 'answer_customer'
+        reason = 'reference_only_status'
+        message = (
+            'The order linked to that reference is marked as dispatched. '
+            'Please check the dispatch email for your parcel tracking details.'
+        )
+    else:
+        # Processing in Linnworks is not necessarily proof of dispatch.
+        status = 'processing_or_unconfirmed'
+        action = 'escalate_to_agent'
+        reason = 'no_confirmed_tracking_or_dispatch'
+        message = 'I located the reference, but our team needs to confirm the delivery update.'
+
+    return {
+        'found': True,
+        'action': action,
+        'reason': reason,
+        'channel_reference': reference,
+        # Deliberately no order ID, name, address, products, courier, or tracking.
+        'order': {'status': status},
+        'customer_message': message,
+    }
+
+
 @app.post('/v1/orders/lookup', dependencies=[Depends(require_auth)])
 async def lookup(request: LookupRequest):
-    if os.getenv('SERVICE_ENABLED', 'true').lower() != 'true':
-        return escalate('service_disabled', request.channel_reference.strip())
-    reference = request.channel_reference.strip()
+    reference = (request.channel_reference or request.order_id or '').strip()
     if not reference:
-        raise HTTPException(422, detail='Channel reference is required')
+        raise HTTPException(422, detail='An order ID or channel reference is required')
+    if request.channel_reference and request.order_id and normalize(request.channel_reference) != normalize(request.order_id):
+        raise HTTPException(422, detail='Provide only one order identifier')
+    if os.getenv('SERVICE_ENABLED', 'true').lower() != 'true':
+        return escalate('service_disabled', reference)
     try:
         orders = await client.search(reference)
     except LinnworksUnavailable as exc:
@@ -219,15 +274,19 @@ async def lookup(request: LookupRequest):
         return escalate('order_not_found', reference)
     if len(matches) != 1:
         return escalate('multiple_matching_orders', reference)
-    result = format_order(matches[0], reference)
-    # With email supplied, refuse to reveal order details when we cannot prove the order belongs to that email.
+
     if request.requester_email:
+        # An email supplied in trusted Zendesk context can unlock detailed
+        # tracking information. A mismatch never falls back to detailed data.
         stored = extract_email(matches[0])
         if not stored or normalize(stored) != normalize(request.requester_email):
             return escalate('requester_email_not_matched', reference)
+        result = format_order(matches[0], reference)
     else:
-        # An order reference alone is not authentication. Keep details internal until verified by email.
-        return escalate('requester_email_required', reference)
+        # Reference-only is allowed, but no identifying or tracking data leaves
+        # the API. Basic dispatch status may be used in an automated response.
+        result = format_reference_only(matches[0], reference)
+
     if os.getenv('AUTO_REPLY_ENABLED', 'true').lower() != 'true':
         result['action'] = 'escalate_to_agent'
         result['reason'] = 'auto_reply_disabled'
