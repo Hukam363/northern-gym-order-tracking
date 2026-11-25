@@ -3,6 +3,7 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -37,6 +38,83 @@ def pick(data: dict, *keys: str) -> Any:
 
 def normalize(value: Any) -> str:
     return str(value or '').strip().casefold()
+
+
+# Approved, generic courier tracking pages. These are not individual parcel URLs.
+# Only ShippingInfo.PostalServiceName can authorize a carrier match: never
+# infer the carrier from its tracking-number pattern, Vendor, or marketplace.
+APPROVED_COURIERS = {
+    'Evri': 'https://www.evri.com/track-a-parcel',
+    'Royal Mail': 'https://www.royalmail.com/track-your-item',
+    'Parcelforce': 'https://www.parcelforce.com/track-trace',
+    'DPD': 'https://tracking.dpd.co.uk/',
+    'DHL Express': 'https://uk.express.dhl.com/track-a-parcel/',
+    'DHL eCommerce UK': 'https://track.dhlparcel.co.uk/',
+    'UPS': 'https://www.ups.com/track',
+    'FedEx': 'https://www.fedex.com/en-gb/tracking.html',
+}
+
+
+def courier_from_postal_service(postal_service_name: Any) -> dict[str, str] | None:
+    """Strictly identify a *single* approved courier from Linnworks service text.
+
+    Partial service names such as 'Evri Next Day - Account Linked' are accepted,
+    but generic DHL, Amazon Buy Shipping, and conflicting vendor strings aren't.
+    """
+    value = ' '.join(str(postal_service_name or '').casefold().split())
+    if not value or 'amazon buy shipping' in value:
+        return None
+
+    matches: list[str] = []
+    patterns = {
+        'Evri': r'\bevri\b',
+        'Royal Mail': r'\broyal\s+mail\b',
+        'Parcelforce': r'\bparcelforce\b',
+        'DPD': r'\bdpd\b',
+        'UPS': r'\bups\b',
+        'FedEx': r'\bfed\s*ex\b',
+    }
+    for courier, pattern in patterns.items():
+        if re.search(pattern, value):
+            matches.append(courier)
+
+    if re.search(r'\bdhl\b', value):
+        express = re.search(r'\bdhl\s+express\b', value)
+        ecommerce = re.search(r'\bdhl\s+(?:e[\s-]?commerce(?:\s+uk)?|parcel\s+uk)\b', value)
+        if express and not ecommerce:
+            matches.append('DHL Express')
+        elif ecommerce and not express:
+            matches.append('DHL eCommerce UK')
+        else:
+            return None
+
+    if len(matches) != 1:
+        return None
+    courier = matches[0]
+    return {'courier': courier, 'tracking_page_url': APPROVED_COURIERS[courier]}
+
+
+def tracking_page_message(reference: str, shipments: list[dict[str, str]]) -> str:
+    """Only report what Linnworks contains; never claim a live carrier scan."""
+    if len(shipments) == 1:
+        shipment = shipments[0]
+        return (
+            f'I found tracking information for order {reference}. '
+            f'Your tracking number is {shipment["tracking_number"]}. '
+            f'You can check the latest updates with {shipment["courier"]} at '
+            f'{shipment["tracking_page_url"]}. '
+            'Enter your tracking number there and your delivery postcode if requested.'
+        )
+    parts = [
+        f'I found {len(shipments)} tracking numbers associated with order {reference}.'
+    ]
+    for index, shipment in enumerate(shipments, 1):
+        parts.append(
+            f'Parcel {index}: {shipment["courier"]}, tracking number '
+            f'{shipment["tracking_number"]}. Tracking page: {shipment["tracking_page_url"]}.'
+        )
+    parts.append('Enter each tracking number on its courier page and your delivery postcode if requested.')
+    return ' '.join(parts)
 
 
 def require_auth(authorization: str | None = Header(default=None)) -> None:
@@ -178,85 +256,75 @@ def escalate(reason: str, reference: str) -> dict:
 
 
 def format_order(order: dict, reference: str) -> dict:
+    """Verified-email details path; only link an approved, unambiguous courier."""
     general = order.get('GeneralInfo') or {}
     shipping = order.get('ShippingInfo') or {}
     processed = bool(order.get('Processed'))
-    tracking_number = shipping.get('TrackingNumber') or None
-    carrier = shipping.get('Vendor') or None
-    status = 'dispatched' if processed else 'not_yet_dispatched'
-    if general.get('HoldOrCancel'):
-        status = 'on_hold_or_cancelled'
-    elif general.get('PartShipped') and not processed:
-        status = 'partially_dispatched'
+    tracking_number = str(shipping.get('TrackingNumber') or '').strip()
+    held = bool(general.get('HoldOrCancel'))
+    if held or not processed or not tracking_number:
+        return escalate('no_confirmed_tracking_or_dispatch', reference)
+    mapping = courier_from_postal_service(shipping.get('PostalServiceName'))
+    if not mapping:
+        return escalate('courier_unrecognised', reference)
+    shipment = {'tracking_number': tracking_number, **mapping}
     items = order.get('Items') or []
-    safe_items = [{'sku': x.get('SKU'), 'name': x.get('Title') or x.get('ItemName'), 'quantity': x.get('Quantity')}
-                  for x in items if isinstance(x, dict)]
+    safe_items = [
+        {'sku': x.get('SKU'), 'name': x.get('Title') or x.get('ItemName'), 'quantity': x.get('Quantity')}
+        for x in items if isinstance(x, dict)
+    ]
     return {
-        'found': True, 'action': 'answer_customer' if status == 'dispatched' and tracking_number else 'escalate_to_agent',
-        'reason': None if status == 'dispatched' and tracking_number else 'no_confirmed_tracking_or_dispatch',
+        'found': True, 'action': 'answer_customer', 'reason': 'tracking_page_available',
         'channel_reference': reference,
         'order': {
             'linnworks_order_id': order.get('OrderId'),
             'linnworks_order_number': order.get('NumOrderId'),
             'channel_reference': general.get('ReferenceNum') or reference,
-            'source': general.get('Source'), 'status': status,
+            'source': general.get('Source'), 'status': 'tracking_available',
             'processed': processed, 'processed_at': order.get('ProcessedDateTime'),
-            'carrier': carrier, 'postal_service': shipping.get('PostalServiceName'),
-            'tracking_number': tracking_number, 'tracking_url': None,
+            'carrier': mapping['courier'], 'postal_service': shipping.get('PostalServiceName'),
+            'tracking_number': tracking_number,
+            'tracking_page_url': mapping['tracking_page_url'],
+            'tracking_url': None,  # Never claim the generic page is a personalised tracking URL.
             'received_at': general.get('ReceivedDate'), 'items': safe_items
         },
-        'customer_message': (
-            f'Your order {reference} has been dispatched. Tracking number: {tracking_number}.'
-            if status == 'dispatched' and tracking_number else
-            'I found your order, but cannot confirm a tracking update yet. I will pass this to our team.'
-        )
+        'customer_message': tracking_page_message(reference, [shipment]),
     }
 
 
 def format_reference_only(order: dict, reference: str) -> dict:
-    """Provide dispatch status and a tracking number without an email challenge.
+    """Reference-only response restricted to courier, tracking and generic URL.
 
-    Only an exact, unique order match may reach here. Never return a customer's
-    name, address, email, items, or other Linnworks order metadata in this path.
-    Tracking numbers may reveal delivery details on some carrier websites;
-    this endpoint must be restricted to the protected server-side Zendesk action.
+    The reference is *not* customer ownership verification. It remains necessary
+    to restrict this endpoint to authorised Zendesk workflows and prevent
+    enumeration; see the handover security guidance.
     """
     general = order.get('GeneralInfo') or {}
     shipping = order.get('ShippingInfo') or {}
     held = bool(general.get('HoldOrCancel'))
     tracking_number = str(shipping.get('TrackingNumber') or '').strip()
-    dispatched_with_tracking = bool(order.get('Processed') and tracking_number)
+    processed_with_tracking = bool(order.get('Processed') and tracking_number)
 
     if held:
-        status = 'requires_agent'
-        action = 'escalate_to_agent'
-        reason = 'manual_review_required'
-        message = 'Our team will review the order enquiry and provide an update.'
-        tracking_number = None
-    elif dispatched_with_tracking:
-        status = 'dispatched'
-        action = 'answer_customer'
-        reason = 'reference_only_tracking_available'
-        message = (
-            f'The order linked to reference {reference} has been dispatched. '
-            f'Your tracking number is {tracking_number}.'
-        )
-    else:
-        # Processing in Linnworks alone is not necessarily proof of dispatch.
-        status = 'processing_or_unconfirmed'
-        action = 'escalate_to_agent'
-        reason = 'no_confirmed_tracking_or_dispatch'
-        message = 'I located the reference, but our team needs to confirm the delivery update.'
-        tracking_number = None
+        return escalate('manual_review_required', reference)
+    if not processed_with_tracking:
+        return escalate('no_confirmed_tracking_or_dispatch', reference)
 
+    mapping = courier_from_postal_service(shipping.get('PostalServiceName'))
+    if not mapping:
+        return escalate('courier_unrecognised', reference)
+    shipment = {'tracking_number': tracking_number, **mapping}
     return {
-        'found': True,
-        'action': action,
-        'reason': reason,
+        'found': True, 'action': 'answer_customer',
+        'reason': 'reference_only_tracking_page_available',
         'channel_reference': reference,
-        # Only status and the tracking number (when verified as dispatched).
-        'order': {'status': status, 'tracking_number': tracking_number},
-        'customer_message': message,
+        'order': {
+            'status': 'tracking_available',
+            'tracking_number': tracking_number,
+            'courier': mapping['courier'],
+            'tracking_page_url': mapping['tracking_page_url'],
+        },
+        'customer_message': tracking_page_message(reference, [shipment]),
     }
 
 
@@ -302,49 +370,46 @@ def format_matching_multi_orders(orders: list[dict], reference: str) -> dict:
     if not identities[0] or any(identity != identities[0] for identity in identities):
         return escalate('multiple_orders_identity_unconfirmed', reference)
 
-    tracking_numbers = []
+    tracking_numbers: list[str] = []
+    shipments: list[dict[str, str]] = []
     for order in orders:
         general = order.get('GeneralInfo') or {}
         shipping = order.get('ShippingInfo') or {}
         tracking = str(shipping.get('TrackingNumber') or '').strip()
         if general.get('HoldOrCancel') or not order.get('Processed') or not tracking:
             return escalate('multiple_orders_dispatch_unconfirmed', reference)
-        if tracking not in tracking_numbers:
+        mapping = courier_from_postal_service(shipping.get('PostalServiceName'))
+        if not mapping:
+            return escalate('courier_unrecognised', reference)
+        shipment = {'tracking_number': tracking, **mapping}
+        if tracking in tracking_numbers:
+            prior = shipments[tracking_numbers.index(tracking)]
+            if prior['courier'] != shipment['courier']:
+                return escalate('conflicting_courier_for_tracking', reference)
+        else:
             tracking_numbers.append(tracking)
+            shipments.append(shipment)
 
-    if not tracking_numbers:
+    if not shipments:
         return escalate('multiple_orders_dispatch_unconfirmed', reference)
 
+    # Preserve the existing Zendesk tracking_number string mapping.
     joined = ', '.join(tracking_numbers)
-    if len(tracking_numbers) == 1:
-        message = (
-            f'The order linked to reference {reference} has been dispatched. '
-            f'Your tracking number is {tracking_numbers[0]}.'
-        )
-    else:
-        message = (
-            f'The order linked to reference {reference} has {len(tracking_numbers)} '
-            f'tracking numbers. Both shipments are marked as dispatched. '
-            f'Your tracking numbers are {joined}.'
-            if len(tracking_numbers) == 2 else
-            f'The order linked to reference {reference} has {len(tracking_numbers)} '
-            f'tracking numbers and all associated shipments are marked as '
-            f'dispatched. Your tracking numbers are {joined}.'
-        )
-
+    courier_urls = {item['tracking_page_url'] for item in shipments}
     return {
         'found': True,
         'action': 'answer_customer',
         'reason': 'multiple_shipment_tracking_available',
         'channel_reference': reference,
         'order': {
-            'status': 'dispatched',
-            # Keep legacy Zendesk output mapped to one string. No mapping change
-            # is needed for the existing tracking_number output.
+            'status': 'tracking_available',
             'tracking_number': joined,
             'tracking_numbers': tracking_numbers,
+            'shipments': shipments,
+            # Only a top-level URL if every parcel uses the same courier.
+            'tracking_page_url': next(iter(courier_urls)) if len(courier_urls) == 1 else None,
         },
-        'customer_message': message,
+        'customer_message': tracking_page_message(reference, shipments),
     }
 
 
