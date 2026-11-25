@@ -1,5 +1,7 @@
-[README.md](https://github.com/user-attachments/files/35411980/README.md)
+[README.md](https://github.com/user-attachments/files/35424533/README.md)
 # Northern Gym — Linnworks lookup API for Zendesk
+
+**Update (25 November 2026):** Multiple Linnworks order records that share an exact channel reference can now return multiple tracking numbers **only when** shipping email, recipient, street address, postcode, country, Source and SubSource all agree, every order is processed with tracking, and the group is no larger than five records. Otherwise the API escalates. This preserves the existing Zendesk `order.tracking_number` output by joining tracking numbers into a string and adds an optional `order.tracking_numbers` array. This change is not deployed until you replace `main.py` in GitHub and Render redeploys.
 
 **Purpose:** Zendesk AI agents / actions call one endpoint using either a channel reference or a Linnworks order ID. The customer does **not** have to supply an email address or complete an OTP check. Reference-only lookups can return dispatch status **and tracking number** if Linnworks has confirmed the order as dispatched with tracking. A matching email unlocks additional order fields in trusted Zendesk context. **AfterShip is optional and is not integrated in this version.**
 
@@ -109,3 +111,12 @@ curl -X POST 'http://127.0.0.1:8000/v1/orders/lookup' \
 ## Verify before production
 
 Review actual Linnworks responses, especially search coverage for both reference and Linnworks order-number searches, and processed orders. Test real dispatched, open, no-match, duplicate-reference, wrong-email, and expired-session cases. **Local tests cover response mapping; the tracking-number update must still be deployed and live-tested against Linnworks / Zendesk.**
+
+
+## Multi-shipment reference support
+
+**Example:** `#NORTHERN115347` returned two exact Linnworks records in live diagnostics, with different tracking numbers and the same customer email. That establishes a potential split shipment, not proof of the same delivery destination. Linnworks supports split shipments and multiple tracking numbers; we require further consistency checks before enabling a reference-only response.
+
+To test after deployment, run the existing Render Shell API test with `channel_reference` set to `#NORTHERN115347`. Success returns `order.tracking_number` containing both values separated by commas and `customer_message` mentioning both. No customer's email, name or address appears in the API response. If identity/destination fields are missing or different, expect `multiple_orders_identity_unconfirmed` and an agent escalation. If a shipment is not dispatched or has no tracking, expect `multiple_orders_dispatch_unconfirmed`.
+
+**Zendesk mapping:** The existing `order.tracking_number` output remains a string for compatibility; `customer_message` can be used as before. The new `order.tracking_numbers` array is optional. Do not publish order details until you have reviewed customer authentication/identification risk, since order-reference knowledge alone is not proof of identity.
