@@ -95,26 +95,48 @@ def courier_from_postal_service(postal_service_name: Any) -> dict[str, str] | No
 
 
 def tracking_page_message(reference: str, shipments: list[dict[str, str]]) -> str:
-    """Only report what Linnworks contains; never claim a live carrier scan."""
+    """Return a clean, plain-text customer response for Zendesk.
+
+    Show one approved, generic courier URL per parcel on its own line so chat
+    clients can automatically linkify it. Do not send Markdown link syntax
+    (which may appear literally as '[Tracking page]' in Zendesk previews).
+    Never imply we have checked the courier's live tracking scans.
+    """
+    if not shipments:
+        return 'Our team will review your order tracking enquiry.'
+
     if len(shipments) == 1:
         shipment = shipments[0]
-        return (
-            f'I found tracking information for order {reference}. '
-            f'Your tracking number is {shipment["tracking_number"]}. '
-            f'You can check the latest updates with {shipment["courier"]} at '
-            f'{shipment["tracking_page_url"]}. '
-            'Enter your tracking number there and your delivery postcode if requested.'
-        )
+        return '\n'.join([
+            f"I've found tracking information for order {reference}.",
+            '',
+            f'Courier: {shipment["courier"]}',
+            f'Your tracking number is {shipment["tracking_number"]}',
+            '',
+            f'Track your parcel with {shipment["courier"]}:',
+            shipment['tracking_page_url'],
+            '',
+            'Open the courier website, enter your tracking number, and provide '
+            'your delivery postcode if requested.',
+        ])
+
     parts = [
-        f'I found {len(shipments)} tracking numbers associated with order {reference}.'
+        f"I've found tracking information for {len(shipments)} parcels linked to order {reference}."
     ]
     for index, shipment in enumerate(shipments, 1):
-        parts.append(
-            f'Parcel {index}: {shipment["courier"]}, tracking number '
-            f'{shipment["tracking_number"]}. Tracking page: {shipment["tracking_page_url"]}.'
-        )
-    parts.append('Enter each tracking number on its courier page and your delivery postcode if requested.')
-    return ' '.join(parts)
+        parts.extend([
+            '',
+            f'Parcel {index} — {shipment["courier"]}',
+            f'Tracking number: {shipment["tracking_number"]}',
+            f'Track with {shipment["courier"]}:',
+            shipment['tracking_page_url'],
+        ])
+    parts.extend([
+        '',
+        'Open each courier website, enter the matching tracking number, and '
+        'provide your delivery postcode if requested.',
+    ])
+    return '\n'.join(parts)
 
 
 def require_auth(authorization: str | None = Header(default=None)) -> None:
