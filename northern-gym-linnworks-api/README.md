@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/35424533/README.md)
+[README.md](https://github.com/user-attachments/files/35426068/README.md)
 # Northern Gym — Linnworks lookup API for Zendesk
 
 **Update (25 November 2026):** Multiple Linnworks order records that share an exact channel reference can now return multiple tracking numbers **only when** shipping email, recipient, street address, postcode, country, Source and SubSource all agree, every order is processed with tracking, and the group is no larger than five records. Otherwise the API escalates. This preserves the existing Zendesk `order.tracking_number` output by joining tracking numbers into a string and adds an optional `order.tracking_numbers` array. This change is not deployed until you replace `main.py` in GitHub and Render redeploys.
@@ -120,3 +120,54 @@ Review actual Linnworks responses, especially search coverage for both reference
 To test after deployment, run the existing Render Shell API test with `channel_reference` set to `#NORTHERN115347`. Success returns `order.tracking_number` containing both values separated by commas and `customer_message` mentioning both. No customer's email, name or address appears in the API response. If identity/destination fields are missing or different, expect `multiple_orders_identity_unconfirmed` and an agent escalation. If a shipment is not dispatched or has no tracking, expect `multiple_orders_dispatch_unconfirmed`.
 
 **Zendesk mapping:** The existing `order.tracking_number` output remains a string for compatibility; `customer_message` can be used as before. The new `order.tracking_numbers` array is optional. Do not publish order details until you have reviewed customer authentication/identification risk, since order-reference knowledge alone is not proof of identity.
+
+## Courier tracking pages enhancement — 25 November 2026
+
+This update adds **strict mapping from `ShippingInfo.PostalServiceName` to an approved, generic courier tracking page**, preserving the existing action name, bearer token, endpoint, and `customer_message` output. See `ZENDESK_PROCEDURE.md` for paste-ready AI Agent instructions and ownership-check considerations.
+
+### Supported couriers and official generic URLs
+
+| Service detected in PostalServiceName | Customer-facing tracking page |
+| --- | --- |
+| Evri | https://www.evri.com/track-a-parcel |
+| Royal Mail | https://www.royalmail.com/track-your-item |
+| Parcelforce | https://www.parcelforce.com/track-trace |
+| DPD | https://tracking.dpd.co.uk/ |
+| DHL Express | https://uk.express.dhl.com/track-a-parcel/ |
+| DHL eCommerce UK / DHL Parcel UK | https://track.dhlparcel.co.uk/ |
+| UPS | https://www.ups.com/track |
+| FedEx | https://www.fedex.com/en-gb/tracking.html |
+
+The DHL Parcel URL redirects to DHL eCommerce UK's tracking page. Parcelforce points users to Royal Mail Track and Trace under its current network arrangement. URLs are *not* populated with tracking numbers or personal data.
+
+**Strict matching:** Case-insensitive; extra wording like `Evri Next Day - Account Linked` is acceptable. A generic `DHL`, `Amazon Buy Shipping`, or services with contradictory carrier names cause `courier_unrecognised` escalation. We never infer a courier from `Vendor` or tracking-number format.
+
+**Success JSON (illustrative):**
+
+```json
+{
+  "found": true,
+  "action": "answer_customer",
+  "reason": "reference_only_tracking_page_available",
+  "channel_reference": "EXAMPLE-ORDER",
+  "order": {
+    "status": "tracking_available",
+    "tracking_number": "EXAMPLE123",
+    "courier": "Evri",
+    "tracking_page_url": "https://www.evri.com/track-a-parcel"
+  },
+  "customer_message": "I found tracking information for order EXAMPLE-ORDER. Your tracking number is EXAMPLE123. You can check the latest updates with Evri at https://www.evri.com/track-a-parcel. Enter your tracking number there and your delivery postcode if requested."
+}
+```
+
+For compatible split shipments, `order.tracking_number` remains a comma-separated string, `order.tracking_numbers` remains an array, and `order.shipments[]` now maps each tracking number to its own approved courier and generic page. If every shipment has the same courier, `order.tracking_page_url` is set; otherwise it is `null` and the per-shipment URLs are provided. Unsupported courier mappings cause escalation rather than partial disclosure.
+
+**Important semantic correction:** Linnworks `Processed = true` alone does not prove courier collection or delivery. Customer messages say tracking information is available and direct customers to the courier's tracking site for live updates. The API now uses `order.status = tracking_available` in successful tracking responses rather than claiming `dispatched`; if any Zendesk branch hardcodes `dispatched`, update it to branch on `action = answer_customer` instead.
+
+**Limitations:** This update does not verify the caller customer's ownership, perform live courier scans, or implement rate limiting. The existing reference-only workflow still discloses tracking numbers after a unique, exact lookup or safely grouped split shipment. Restrict this action to trusted customer contexts, enforce ownership verification in Zendesk, and implement server-side verification and anti-enumeration safeguards before public rollout.
+
+### Installation
+
+Replace `main.py`, `tests/test_lookup.py` and `README.md` in the existing `northern-gym-linnworks-api/` GitHub folder; add `ZENDESK_PROCEDURE.md` there. Keep `render.yaml`, `requirements.txt`, environment variables, and all stored secrets unchanged. Let Render deploy the new commit, then run the new test in its Shell and check Zendesk's `customer_message` output.
+
+**Test caution:** If a Linnworks record has tracking but no courier-specific `PostalServiceName`, the new strict mapping returns `courier_unrecognised` and escalates. This is intentional: it does not guess from `ShippingInfo.Vendor` or from a tracking-number pattern. Check representative real postal-service names before a broad deployment.
