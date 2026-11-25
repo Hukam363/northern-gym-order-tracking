@@ -214,43 +214,48 @@ def format_order(order: dict, reference: str) -> dict:
 
 
 def format_reference_only(order: dict, reference: str) -> dict:
-    """Respond to an unverified reference without releasing tracking or personal data.
+    """Provide dispatch status and a tracking number without an email challenge.
 
-    A customer knowing an order number is not proof they own the order. In
-    particular, some couriers' tracking pages can expose delivery details.
+    Only an exact, unique order match may reach here. Never return a customer's
+    name, address, email, items, or other Linnworks order metadata in this path.
+    Tracking numbers may reveal delivery details on some carrier websites;
+    this endpoint must be restricted to the protected server-side Zendesk action.
     """
     general = order.get('GeneralInfo') or {}
     shipping = order.get('ShippingInfo') or {}
     held = bool(general.get('HoldOrCancel'))
-    dispatched_with_tracking = bool(order.get('Processed') and shipping.get('TrackingNumber'))
+    tracking_number = str(shipping.get('TrackingNumber') or '').strip()
+    dispatched_with_tracking = bool(order.get('Processed') and tracking_number)
 
     if held:
         status = 'requires_agent'
         action = 'escalate_to_agent'
         reason = 'manual_review_required'
         message = 'Our team will review the order enquiry and provide an update.'
+        tracking_number = None
     elif dispatched_with_tracking:
         status = 'dispatched'
         action = 'answer_customer'
-        reason = 'reference_only_status'
+        reason = 'reference_only_tracking_available'
         message = (
-            'The order linked to that reference is marked as dispatched. '
-            'Please check the dispatch email for your parcel tracking details.'
+            f'The order linked to reference {reference} has been dispatched. '
+            f'Your tracking number is {tracking_number}.'
         )
     else:
-        # Processing in Linnworks is not necessarily proof of dispatch.
+        # Processing in Linnworks alone is not necessarily proof of dispatch.
         status = 'processing_or_unconfirmed'
         action = 'escalate_to_agent'
         reason = 'no_confirmed_tracking_or_dispatch'
         message = 'I located the reference, but our team needs to confirm the delivery update.'
+        tracking_number = None
 
     return {
         'found': True,
         'action': action,
         'reason': reason,
         'channel_reference': reference,
-        # Deliberately no order ID, name, address, products, courier, or tracking.
-        'order': {'status': status},
+        # Only status and the tracking number (when verified as dispatched).
+        'order': {'status': status, 'tracking_number': tracking_number},
         'customer_message': message,
     }
 
@@ -283,8 +288,8 @@ async def lookup(request: LookupRequest):
             return escalate('requester_email_not_matched', reference)
         result = format_order(matches[0], reference)
     else:
-        # Reference-only is allowed, but no identifying or tracking data leaves
-        # the API. Basic dispatch status may be used in an automated response.
+        # Reference-only may reveal tracking but never address, email or items.
+        # Protect this endpoint behind a trusted Zendesk server-side action.
         result = format_reference_only(matches[0], reference)
 
     if os.getenv('AUTO_REPLY_ENABLED', 'true').lower() != 'true':
