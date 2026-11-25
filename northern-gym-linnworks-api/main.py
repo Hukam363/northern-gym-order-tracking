@@ -424,10 +424,26 @@ async def lookup(request: LookupRequest):
         return escalate('service_disabled', reference)
     try:
         orders = await client.search(reference)
+        matches = [order for order in orders if reference_matches(order, normalize(reference))]
+
+        # Zendesk's AI Agent can omit the leading '#' from NORTHERN order refs.
+        # Retry only a precisely shaped Northern channel reference and only
+        # after the original supplied identifier yielded no exact matches.
+        # Keep the original exact-match and multi-shipment identity safeguards;
+        # never broaden arbitrary order IDs or guess a similar reference.
+        if not matches and re.fullmatch(r'NORTHERN[0-9]+', reference, re.IGNORECASE):
+            hashed_reference = f'#{reference}'
+            hashed_orders = await client.search(hashed_reference)
+            matches = [
+                order for order in hashed_orders
+                if reference_matches(order, normalize(hashed_reference))
+            ]
+            if matches:
+                reference = hashed_reference
     except LinnworksUnavailable as exc:
         log.error('Lookup unavailable: %s', exc)
         return escalate('linnworks_unavailable', reference)
-    matches = [order for order in orders if reference_matches(order, normalize(reference))]
+
     if not matches:
         return escalate('order_not_found', reference)
     if len(matches) != 1:
