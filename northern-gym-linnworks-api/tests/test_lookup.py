@@ -98,3 +98,142 @@ def test_api_reference_only_and_email_verification(monkeypatch):
 
         no_auth = api.post('/v1/orders/lookup', json={'order_id': '4321'})
         assert no_auth.status_code == 401
+
+
+# New: two distinct Linnworks records for one customer/channel reference.
+def sample_split_orders():
+    import copy
+    one = copy.deepcopy(SAMPLE)
+    two = copy.deepcopy(SAMPLE)
+    for o in (one, two):
+        o['GeneralInfo']['ReferenceNum'] = '#NORTHERN115347'
+        o['GeneralInfo']['Source'] = 'SHOPIFY'
+        o['GeneralInfo']['SubSource'] = 'NORTHERN'
+        o['CustomerInfo']['Address'] = {
+            'EmailAddress': 'client@example.com',
+            'FullName': 'Test Customer',
+            'Address1': '123 Example Street',
+            'PostCode': 'NG1 1AA',
+            'Country': 'United Kingdom',
+        }
+    one['OrderId'] = 'uuid-order-a'
+    one['NumOrderId'] = 5050628
+    one['ShippingInfo']['TrackingNumber'] = 'TRACK-A'
+    two['OrderId'] = 'uuid-order-b'
+    two['NumOrderId'] = 5050678
+    two['ShippingInfo']['TrackingNumber'] = 'TRACK-B'
+    return one, two
+
+
+def test_two_matching_shipments_return_both_tracking_numbers():
+    from main import format_matching_multi_orders
+    one, two = sample_split_orders()
+    result = format_matching_multi_orders([one, two], '#NORTHERN115347')
+    assert result['found'] is True
+    assert result['action'] == 'answer_customer'
+    assert result['order']['tracking_numbers'] == ['TRACK-A', 'TRACK-B']
+    assert result['order']['tracking_number'] == 'TRACK-A, TRACK-B'
+    assert 'TRACK-A, TRACK-B' in result['customer_message']
+    assert 'client@example.com' not in str(result)
+    assert '123 Example Street' not in str(result)
+
+
+def test_split_orders_with_different_address_escalate():
+    from main import format_matching_multi_orders
+    one, two = sample_split_orders()
+    two['CustomerInfo']['Address']['PostCode'] = 'NG1 2AA'
+    result = format_matching_multi_orders([one, two], '#NORTHERN115347')
+    assert result['action'] == 'escalate_to_agent'
+    assert result['reason'] == 'multiple_orders_identity_unconfirmed'
+    assert result['order'] is None
+
+
+def test_split_orders_with_missing_address_escalate():
+    from main import format_matching_multi_orders
+    one, two = sample_split_orders()
+    two['CustomerInfo']['Address'].pop('FullName')
+    result = format_matching_multi_orders([one, two], '#NORTHERN115347')
+    assert result['action'] == 'escalate_to_agent'
+
+
+def test_split_orders_with_different_email_escalate():
+    from main import format_matching_multi_orders
+    one, two = sample_split_orders()
+    two['CustomerInfo']['Address']['EmailAddress'] = 'different@example.com'
+    result = format_matching_multi_orders([one, two], '#NORTHERN115347')
+    assert result['action'] == 'escalate_to_agent'
+    assert result['order'] is None
+
+
+def test_split_orders_without_tracking_escalate():
+    from main import format_matching_multi_orders
+    one, two = sample_split_orders()
+    two['ShippingInfo']['TrackingNumber'] = ''
+    result = format_matching_multi_orders([one, two], '#NORTHERN115347')
+    assert result['action'] == 'escalate_to_agent'
+    assert result['reason'] == 'multiple_orders_dispatch_unconfirmed'
+
+
+def test_split_orders_on_hold_escalate():
+    from main import format_matching_multi_orders
+    one, two = sample_split_orders()
+    two['GeneralInfo']['HoldOrCancel'] = True
+    assert format_matching_multi_orders([one, two], '#NORTHERN115347')['action'] == 'escalate_to_agent'
+
+
+def test_split_orders_dedup_same_tracking_number():
+    from main import format_matching_multi_orders
+    one, two = sample_split_orders()
+    two['ShippingInfo']['TrackingNumber'] = 'TRACK-A'
+    result = format_matching_multi_orders([one, two], '#NORTHERN115347')
+    assert result['order']['tracking_numbers'] == ['TRACK-A']
+    assert 'tracking number is TRACK-A' in result['customer_message']
+
+
+def test_api_split_reference(monkeypatch):
+    from fastapi.testclient import TestClient
+    import main
+    one, two = sample_split_orders()
+    monkeypatch.setenv('API_BEARER_TOKEN', 'test-bearer-token')
+    monkeypatch.setenv('AUTO_REPLY_ENABLED', 'true')
+
+    async def fake_search(_):
+        return [one, two]
+
+    monkeypatch.setattr(main.client, 'search', fake_search)
+    with TestClient(main.app) as api:
+        result = api.post('/v1/orders/lookup', json={'channel_reference': '#NORTHERN115347'}, headers={'Authorization': 'Bearer test-bearer-token'})
+        assert result.status_code == 200
+        assert result.json()['action'] == 'answer_customer'
+        assert result.json()['order']['tracking_number'] == 'TRACK-A, TRACK-B'
+
+
+def test_multi_order_does_not_conflate_numeric_order_id():
+    from main import format_matching_multi_orders
+    one, two = sample_split_orders()
+    # Identical customer/destination is not enough when one record lacks the
+    # same marketplace/channel identifier.
+    two['GeneralInfo']['ReferenceNum'] = 'DIFFERENT'
+    result = format_matching_multi_orders([one, two], '#NORTHERN115347')
+    assert result['action'] == 'escalate_to_agent'
+    assert result['reason'] == 'multiple_orders_reference_unconfirmed'
+
+
+def test_api_split_order_rejects_supplied_wrong_email(monkeypatch):
+    from fastapi.testclient import TestClient
+    import main
+    one, two = sample_split_orders()
+    monkeypatch.setenv('API_BEARER_TOKEN', 'test-bearer-token')
+
+    async def fake_search(_):
+        return [one, two]
+
+    monkeypatch.setattr(main.client, 'search', fake_search)
+    with TestClient(main.app) as api:
+        result = api.post('/v1/orders/lookup', json={
+            'channel_reference': '#NORTHERN115347',
+            'requester_email': 'wrong@example.com',
+        }, headers={'Authorization': 'Bearer test-bearer-token'})
+        assert result.status_code == 200
+        assert result.json()['reason'] == 'requester_email_not_matched'
+        assert result.json()['order'] is None
