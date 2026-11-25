@@ -31,13 +31,14 @@ def test_order_identifiers():
     assert not reference_matches(SAMPLE, '432')
 
 
-def test_reference_only_does_not_disclose_tracking_or_products():
+def test_reference_only_returns_tracking_but_no_customer_data():
     from main import format_reference_only
     result = format_reference_only(SAMPLE, 'NG-123')
     assert result['found'] is True
     assert result['action'] == 'answer_customer'
-    assert result['order'] == {'status': 'dispatched'}
-    assert 'TRACK123' not in str(result)
+    assert result['order'] == {'status': 'dispatched', 'tracking_number': 'TRACK123'}
+    assert result['reason'] == 'reference_only_tracking_available'
+    assert 'TRACK123' in result['customer_message']
     assert 'Royal Mail' not in str(result)
     assert 'SKU-1' not in str(result)
     assert 'client@example.com' not in str(result)
@@ -48,7 +49,7 @@ def test_reference_only_without_tracking_escalates():
     order = {**SAMPLE, 'ShippingInfo': {}}
     result = format_reference_only(order, 'NG-123')
     assert result['action'] == 'escalate_to_agent'
-    assert result['order'] == {'status': 'processing_or_unconfirmed'}
+    assert result['order'] == {'status': 'processing_or_unconfirmed', 'tracking_number': None}
 
 
 def test_reference_only_on_hold_escalates():
@@ -56,7 +57,8 @@ def test_reference_only_on_hold_escalates():
     order = {**SAMPLE, 'GeneralInfo': {**SAMPLE['GeneralInfo'], 'HoldOrCancel': True}}
     result = format_reference_only(order, 'NG-123')
     assert result['action'] == 'escalate_to_agent'
-    assert result['order'] == {'status': 'requires_agent'}
+    assert result['order'] == {'status': 'requires_agent', 'tracking_number': None}
+    assert 'TRACK123' not in str(result)
 
 
 def test_api_reference_only_and_email_verification(monkeypatch):
@@ -75,11 +77,13 @@ def test_api_reference_only_and_email_verification(monkeypatch):
         ref_only = api.post('/v1/orders/lookup', json={'channel_reference': 'NG-123'}, headers=headers)
         assert ref_only.status_code == 200
         assert ref_only.json()['found'] is True
-        assert ref_only.json()['order'] == {'status': 'dispatched'}
+        assert ref_only.json()['order'] == {'status': 'dispatched', 'tracking_number': 'TRACK123'}
+        assert ref_only.json()['reason'] == 'reference_only_tracking_available'
 
         id_only = api.post('/v1/orders/lookup', json={'order_id': '4321'}, headers=headers)
         assert id_only.status_code == 200
         assert id_only.json()['found'] is True
+        assert id_only.json()['order']['tracking_number'] == 'TRACK123'
 
         mismatch = api.post('/v1/orders/lookup', json={'order_id': '4321', 'requester_email': 'wrong@example.com'}, headers=headers)
         assert mismatch.json()['reason'] == 'requester_email_not_matched'
