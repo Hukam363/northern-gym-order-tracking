@@ -260,6 +260,94 @@ def format_reference_only(order: dict, reference: str) -> dict:
     }
 
 
+def format_matching_multi_orders(orders: list[dict], reference: str) -> dict:
+    """Return tracking for a provably consistent group of split order records.
+
+    Only an exact shared channel reference, the same non-empty customer email,
+    delivery address and source, and dispatched tracking for every record
+    allow reference-only tracking disclosure. Otherwise fail closed.
+    """
+    if not (2 <= len(orders) <= 5):
+        return escalate('multiple_matching_orders', reference)
+
+    # Multiple internal Linnworks IDs must never be merged merely because one
+    # also resembles another record's numeric ID. Every record must carry the
+    # same literal channel reference in a channel-reference field.
+    for order in orders:
+        general = order.get('GeneralInfo') or {}
+        if not any(normalize(general.get(key)) == normalize(reference) for key in (
+            'ReferenceNum', 'SecondaryReference', 'ExternalReferenceNum'
+        )):
+            return escalate('multiple_orders_reference_unconfirmed', reference)
+
+    # Internal matching only. Customer addresses/emails are never returned.
+    def shipment_identity(order: dict) -> tuple[str, ...] | None:
+        customer = order.get('CustomerInfo') or {}
+        address = customer.get('Address') or {}
+        general = order.get('GeneralInfo') or {}
+        email = normalize(address.get('EmailAddress'))
+        name = normalize(address.get('FullName'))
+        address1 = normalize(address.get('Address1'))
+        postcode = normalize(address.get('PostCode')).replace(' ', '')
+        country = normalize(address.get('Country'))
+        source = normalize(general.get('Source'))
+        subsource = normalize(general.get('SubSource'))
+        # Missing identity fields mean we cannot establish these records belong
+        # to the same customer shipment. Deliberately escalate instead.
+        if not all((email, name, address1, postcode, country, source)):
+            return None
+        return (email, name, address1, postcode, country, source, subsource)
+
+    identities = [shipment_identity(order) for order in orders]
+    if not identities[0] or any(identity != identities[0] for identity in identities):
+        return escalate('multiple_orders_identity_unconfirmed', reference)
+
+    tracking_numbers = []
+    for order in orders:
+        general = order.get('GeneralInfo') or {}
+        shipping = order.get('ShippingInfo') or {}
+        tracking = str(shipping.get('TrackingNumber') or '').strip()
+        if general.get('HoldOrCancel') or not order.get('Processed') or not tracking:
+            return escalate('multiple_orders_dispatch_unconfirmed', reference)
+        if tracking not in tracking_numbers:
+            tracking_numbers.append(tracking)
+
+    if not tracking_numbers:
+        return escalate('multiple_orders_dispatch_unconfirmed', reference)
+
+    joined = ', '.join(tracking_numbers)
+    if len(tracking_numbers) == 1:
+        message = (
+            f'The order linked to reference {reference} has been dispatched. '
+            f'Your tracking number is {tracking_numbers[0]}.'
+        )
+    else:
+        message = (
+            f'The order linked to reference {reference} has {len(tracking_numbers)} '
+            f'tracking numbers. Both shipments are marked as dispatched. '
+            f'Your tracking numbers are {joined}.'
+            if len(tracking_numbers) == 2 else
+            f'The order linked to reference {reference} has {len(tracking_numbers)} '
+            f'tracking numbers and all associated shipments are marked as '
+            f'dispatched. Your tracking numbers are {joined}.'
+        )
+
+    return {
+        'found': True,
+        'action': 'answer_customer',
+        'reason': 'multiple_shipment_tracking_available',
+        'channel_reference': reference,
+        'order': {
+            'status': 'dispatched',
+            # Keep legacy Zendesk output mapped to one string. No mapping change
+            # is needed for the existing tracking_number output.
+            'tracking_number': joined,
+            'tracking_numbers': tracking_numbers,
+        },
+        'customer_message': message,
+    }
+
+
 @app.post('/v1/orders/lookup', dependencies=[Depends(require_auth)])
 async def lookup(request: LookupRequest):
     reference = (request.channel_reference or request.order_id or '').strip()
@@ -278,7 +366,20 @@ async def lookup(request: LookupRequest):
     if not matches:
         return escalate('order_not_found', reference)
     if len(matches) != 1:
-        return escalate('multiple_matching_orders', reference)
+        # If Zendesk supplied an email, enforce it for *every* record even in
+        # a multi-shipment group. A mismatched email never unlocks tracking.
+        if request.requester_email and any(
+            normalize(extract_email(o)) != normalize(request.requester_email)
+            for o in matches
+        ):
+            return escalate('requester_email_not_matched', reference)
+        # Never pick an arbitrary order. Only group genuinely consistent
+        # same-customer, same-destination, same-channel shipments.
+        result = format_matching_multi_orders(matches, reference)
+        if os.getenv('AUTO_REPLY_ENABLED', 'true').lower() != 'true':
+            result['action'] = 'escalate_to_agent'
+            result['reason'] = 'auto_reply_disabled'
+        return result
 
     if request.requester_email:
         # An email supplied in trusted Zendesk context can unlock detailed
