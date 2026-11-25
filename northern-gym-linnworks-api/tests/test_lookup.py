@@ -23,3 +23,74 @@ def test_email_extraction():
 
 def test_not_found():
     assert escalate('order_not_found', 'NG-404')['action'] == 'escalate_to_agent'
+
+
+def test_order_identifiers():
+    assert reference_matches(SAMPLE, '4321')
+    assert reference_matches(SAMPLE, 'abc')
+    assert not reference_matches(SAMPLE, '432')
+
+
+def test_reference_only_does_not_disclose_tracking_or_products():
+    from main import format_reference_only
+    result = format_reference_only(SAMPLE, 'NG-123')
+    assert result['found'] is True
+    assert result['action'] == 'answer_customer'
+    assert result['order'] == {'status': 'dispatched'}
+    assert 'TRACK123' not in str(result)
+    assert 'Royal Mail' not in str(result)
+    assert 'SKU-1' not in str(result)
+    assert 'client@example.com' not in str(result)
+
+
+def test_reference_only_without_tracking_escalates():
+    from main import format_reference_only
+    order = {**SAMPLE, 'ShippingInfo': {}}
+    result = format_reference_only(order, 'NG-123')
+    assert result['action'] == 'escalate_to_agent'
+    assert result['order'] == {'status': 'processing_or_unconfirmed'}
+
+
+def test_reference_only_on_hold_escalates():
+    from main import format_reference_only
+    order = {**SAMPLE, 'GeneralInfo': {**SAMPLE['GeneralInfo'], 'HoldOrCancel': True}}
+    result = format_reference_only(order, 'NG-123')
+    assert result['action'] == 'escalate_to_agent'
+    assert result['order'] == {'status': 'requires_agent'}
+
+
+def test_api_reference_only_and_email_verification(monkeypatch):
+    from fastapi.testclient import TestClient
+    import main
+
+    monkeypatch.setenv('API_BEARER_TOKEN', 'test-bearer-token')
+    monkeypatch.setenv('AUTO_REPLY_ENABLED', 'true')
+
+    async def fake_search(reference):
+        return [SAMPLE]
+
+    monkeypatch.setattr(main.client, 'search', fake_search)
+    with TestClient(main.app) as api:
+        headers = {'Authorization': 'Bearer test-bearer-token'}
+        ref_only = api.post('/v1/orders/lookup', json={'channel_reference': 'NG-123'}, headers=headers)
+        assert ref_only.status_code == 200
+        assert ref_only.json()['found'] is True
+        assert ref_only.json()['order'] == {'status': 'dispatched'}
+
+        id_only = api.post('/v1/orders/lookup', json={'order_id': '4321'}, headers=headers)
+        assert id_only.status_code == 200
+        assert id_only.json()['found'] is True
+
+        mismatch = api.post('/v1/orders/lookup', json={'order_id': '4321', 'requester_email': 'wrong@example.com'}, headers=headers)
+        assert mismatch.json()['reason'] == 'requester_email_not_matched'
+        assert mismatch.json()['order'] is None
+
+        verified = api.post('/v1/orders/lookup', json={'order_id': '4321', 'requester_email': 'client@example.com'}, headers=headers)
+        assert verified.json()['found'] is True
+        assert verified.json()['order']['tracking_number'] == 'TRACK123'
+
+        no_id = api.post('/v1/orders/lookup', json={}, headers=headers)
+        assert no_id.status_code == 422
+
+        no_auth = api.post('/v1/orders/lookup', json={'order_id': '4321'})
+        assert no_auth.status_code == 401
