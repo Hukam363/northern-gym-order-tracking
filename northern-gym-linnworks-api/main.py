@@ -80,7 +80,7 @@ def courier_from_postal_service(postal_service_name: Any) -> dict[str, str] | No
 
     if re.search(r'\bdhl\b', value):
         express = re.search(r'\bdhl\s+express\b', value)
-        ecommerce = re.search(r'\bdhl\s+(?:e[\s-]?commerce(?:\s+uk)?|parcel\s+uk)\b', value)
+ecommerce = re.search(r'\bdhl\s+(?:e[\s-]?commerce(?:\s+uk)?|parcel\s+(?:uk|next\s+day))\b', value)
         if express and not ecommerce:
             matches.append('DHL Express')
         elif ecommerce and not express:
